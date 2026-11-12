@@ -204,7 +204,7 @@ class HeadFrame:
 
 @dataclass(slots=True)
 class _SideAssemblyState:
-    """Mutable per-side assembly state for incomplete and emitted components."""
+    """Latest components and next output sequence number for one hand side."""
 
     wrist: WristPose | None = None
     wrist_recv_ts_ns: int | None = None
@@ -214,20 +214,14 @@ class _SideAssemblyState:
     landmarks_source_ts_ns: int | None = None
     wrist_source_frame_seq: int | None = None
     landmarks_source_frame_seq: int | None = None
-    last_emitted_wrist_recv_ts_ns: int | None = None
-    last_emitted_landmarks_recv_ts_ns: int | None = None
     next_sequence_id: int = 0
 
 
 @dataclass(slots=True)
 class _HeadAssemblyState:
-    """Mutable head assembly state for optional `HeadFrame` emission."""
+    """Latest accepted receive time and next output sequence number for head frames."""
 
-    head: HeadPose | None = None
     head_recv_ts_ns: int | None = None
-    head_source_ts_ns: int | None = None
-    head_source_frame_seq: int | None = None
-    last_emitted_head_recv_ts_ns: int | None = None
     next_sequence_id: int = 0
 
 
@@ -240,7 +234,8 @@ class HandFrameAssembler:
 
     Emission policy:
     - A frame is emitted only after both wrist and landmarks are available for a hand side.
-    - A new frame is emitted when at least one component timestamp advances.
+    - Each accepted component update attempts emission using the latest wrist and landmarks.
+    - Equal receive timestamps are accepted; multiple updates may share one socket receive.
     - Stale component updates (older timestamps than currently stored) are ignored.
     """
 
@@ -280,7 +275,7 @@ class HandFrameAssembler:
         """Reset assembler state.
 
         :param side:
-            Optional side to reset. If omitted, both sides are reset.
+            Optional hand side or head to reset. If omitted, all states are reset.
         """
         if side is None:
             self._state[HandSide.LEFT] = _SideAssemblyState()
@@ -304,7 +299,7 @@ class HandFrameAssembler:
         """Push one parsed packet and optionally emit a coherent frame.
 
         :param packet:
-            Parsed wrist or landmarks packet.
+            Parsed wrist, landmarks, or head pose packet.
         :param recv_ts_ns:
             Monotonic receive timestamp in nanoseconds. If omitted, generated
             with ``time.monotonic_ns()``.
@@ -314,7 +309,7 @@ class HandFrameAssembler:
         :param source_ts_ns:
             Optional source timestamp supplied by upstream sender.
         :returns:
-            A newly assembled frame or ``None`` if frame is incomplete/unchanged.
+            A newly assembled frame or ``None`` if incomplete, stale, or head output is disabled.
         """
         recv_ts_ns_value, recv_time_unix_ns_value = self._resolve_timestamps(
             recv_ts_ns=recv_ts_ns,
@@ -386,7 +381,7 @@ class HandFrameAssembler:
         :param source_ts_ns:
             Optional source timestamp supplied by upstream sender.
         :returns:
-            A newly assembled frame or ``None`` if frame is incomplete/unchanged.
+            A newly assembled frame or ``None`` if incomplete, stale, or head output is disabled.
         """
         packet = parse_line(line)
         return self.push_packet(
@@ -404,44 +399,30 @@ class HandFrameAssembler:
         recv_time_unix_ns: int | None,
         source_ts_ns: int | None,
     ) -> HeadFrame | None:
-        """Emit a `HeadFrame` if head state has advanced."""
+        """Emit a `HeadFrame` for each accepted head update, including equal receive times."""
         if (
             self._head_state.head_recv_ts_ns is not None
             and recv_ts_ns < self._head_state.head_recv_ts_ns
         ):
             return None
 
-        self._head_state.head = packet.data
         self._head_state.head_recv_ts_ns = recv_ts_ns
-        self._head_state.head_source_ts_ns = (
-            packet.debug.source_ts_ns if packet.debug is not None else None
-        )
-        self._head_state.head_source_frame_seq = (
-            packet.debug.source_frame_seq if packet.debug is not None else None
-        )
-        if self._head_state.last_emitted_head_recv_ts_ns == self._head_state.head_recv_ts_ns:
-            return None
-
         sequence_id = self._head_state.next_sequence_id
         self._head_state.next_sequence_id += 1
-        self._head_state.last_emitted_head_recv_ts_ns = self._head_state.head_recv_ts_ns
 
         resolved_source_ts_ns = source_ts_ns
-        if resolved_source_ts_ns is None:
-            resolved_source_ts_ns = self._head_state.head_source_ts_ns
-
-        if self._head_state.head is None or self._head_state.head_recv_ts_ns is None:
-            return None
+        if resolved_source_ts_ns is None and packet.debug is not None:
+            resolved_source_ts_ns = packet.debug.source_ts_ns
 
         return HeadFrame(
             side=HandSide.HEAD,
             frame_id=self._frame_id_by_side[HandSide.HEAD],
-            head=self._head_state.head,
+            head=packet.data,
             sequence_id=sequence_id,
-            recv_ts_ns=self._head_state.head_recv_ts_ns,
+            recv_ts_ns=recv_ts_ns,
             recv_time_unix_ns=recv_time_unix_ns,
             source_ts_ns=resolved_source_ts_ns,
-            source_frame_seq=self._head_state.head_source_frame_seq,
+            source_frame_seq=packet.debug.source_frame_seq if packet.debug is not None else None,
         )
 
     def _resolve_timestamps(
@@ -474,7 +455,7 @@ class HandFrameAssembler:
         recv_time_unix_ns: int | None,
         source_ts_ns: int | None,
     ) -> HandFrame | None:
-        """Emit a frame for one hand side if component state has advanced.
+        """Attempt emission after `push_packet` accepts a wrist or landmarks update.
 
         :param side:
             Target hand side for emission.
@@ -483,7 +464,7 @@ class HandFrameAssembler:
         :param source_ts_ns:
             Optional source timestamp associated with this push call.
         :returns:
-            Newly assembled frame when complete and updated, otherwise ``None``.
+            Newly assembled frame when both components are available, otherwise ``None``.
         """
         side_state = self._state[side]
         if (
@@ -494,18 +475,8 @@ class HandFrameAssembler:
         ):
             return None
 
-        has_new_wrist = side_state.last_emitted_wrist_recv_ts_ns != side_state.wrist_recv_ts_ns
-        has_new_landmarks = (
-            side_state.last_emitted_landmarks_recv_ts_ns != side_state.landmarks_recv_ts_ns
-        )
-        if not has_new_wrist and not has_new_landmarks:
-            return None
-
         sequence_id = side_state.next_sequence_id
         side_state.next_sequence_id += 1
-
-        side_state.last_emitted_wrist_recv_ts_ns = side_state.wrist_recv_ts_ns
-        side_state.last_emitted_landmarks_recv_ts_ns = side_state.landmarks_recv_ts_ns
 
         resolved_source_ts_ns = source_ts_ns
         if resolved_source_ts_ns is None:

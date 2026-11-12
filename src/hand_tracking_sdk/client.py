@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -199,7 +199,7 @@ class HTSClient:
         )
         self._stats = ClientStats()
 
-    def iter_events(self) -> Iterator[StreamEvent]:
+    def iter_events(self) -> Generator[StreamEvent, None, None]:
         """Iterate streaming events from configured transport.
 
         :returns:

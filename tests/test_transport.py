@@ -8,6 +8,11 @@ from unittest.mock import Mock
 import pytest
 
 from hand_tracking_sdk import (
+    HandFrame,
+    HeadFrame,
+    HTSClient,
+    HTSClientConfig,
+    StreamOutput,
     TCPClientConfig,
     TCPClientLineReceiver,
     TCPServerConfig,
@@ -17,6 +22,71 @@ from hand_tracking_sdk import (
     UDPLineReceiver,
     UDPReceiverConfig,
 )
+
+
+@pytest.mark.parametrize("mode", ["udp", "tcp_server", "tcp_client"])
+def test_same_receive_updates_survive_delayed_frame_consumption(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    payload = ("\n".join([
+        "Right wrist:, 0, 0, 0, 0, 0, 0, 1",
+        "Right landmarks:, " + ", ".join("0" for _ in range(63)),
+        "Right wrist:, 1, 2, 3, 0, 0, 0, 1",
+        "Right landmarks:, " + ", ".join("1" for _ in range(63)),
+        "Head pose:, 0, 0, 0, 0, 0, 0, 1",
+        "Head pose:, 1, 2, 3, 0, 0, 0, 1",
+    ]) + "\n").encode()
+    sock, server = Mock(), Mock()
+    now_ns = 10**10
+    received_ns = now_ns
+    monkeypatch.setattr("hand_tracking_sdk.transport.monotonic_ns", lambda: now_ns)
+    monkeypatch.setattr("hand_tracking_sdk.frame.monotonic_ns", lambda: now_ns)
+    monkeypatch.setattr("hand_tracking_sdk.transport.socket.socket",
+                        lambda *a: server if mode == "tcp_server" else sock)
+    server.accept.side_effect = [(sock, ("fake", 8000)), BlockingIOError()]
+    monkeypatch.setattr("hand_tracking_sdk.transport.select", Mock(side_effect=[
+        ([server], [], []), ([sock], [], []),
+    ]))
+    sock.recvfrom.side_effect = [(payload, ("fake", 8000))]
+    sock.recv.side_effect = [payload]
+    receiver: UDPLineReceiver | TCPServerLineReceiver | TCPClientLineReceiver
+    if mode == "udp":
+        receiver = UDPLineReceiver()
+    elif mode == "tcp_server":
+        receiver = TCPServerLineReceiver()
+    else:
+        receiver = TCPClientLineReceiver(TCPClientConfig())
+    client = HTSClient(
+        HTSClientConfig(output=StreamOutput.FRAMES), receiver_factory=lambda _: receiver,
+    )
+    events = client.iter_events()
+    try:
+        for sequence_id, (wrist_x, landmark_x) in enumerate([(0, 0), (1, 0), (1, 1)]):
+            frame = next(events)
+            assert isinstance(frame, HandFrame)
+            assert frame.wrist.x == wrist_x
+            assert frame.landmarks.points == ((landmark_x,) * 3,) * 21
+            assert frame.sequence_id == sequence_id
+            assert frame.recv_ts_ns == received_ns
+            assert frame.wrist_recv_ts_ns == received_ns
+            assert frame.landmarks_recv_ts_ns == received_ns
+            assert receiver.last_recv_ts_ns == received_ns
+            now_ns += 10**9
+        for sequence_id in range(2):
+            frame = next(events)
+            assert isinstance(frame, HeadFrame)
+            assert frame.head.x == sequence_id
+            assert frame.sequence_id == sequence_id
+            assert frame.recv_ts_ns == received_ns
+            assert receiver.last_recv_ts_ns == received_ns
+            now_ns += 10**9
+        if mode == "udp":
+            sock.recvfrom.assert_called_once()
+        else:
+            sock.recv.assert_called_once()
+    finally:
+        events.close()
 
 
 @pytest.mark.parametrize("mode", ["udp", "tcp_server", "tcp_client"])
@@ -31,6 +101,7 @@ def test_receive_timestamps_survive_queueing(monkeypatch: pytest.MonkeyPatch, mo
     monkeypatch.setattr("hand_tracking_sdk.transport.select", Mock(side_effect=[
         ([server], [], []), ([sock], [], []), ([sock], [], []),
     ]))
+    receiver: UDPLineReceiver | TCPServerLineReceiver | TCPClientLineReceiver
     if mode == "udp":
         receiver = UDPLineReceiver()
         sock.recvfrom.side_effect = [

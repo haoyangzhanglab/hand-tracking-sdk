@@ -77,9 +77,12 @@ The SDK validates packet labels, hand side, and exact value counts.
 
 ### Frame Assembly
 
-`HandFrameAssembler` correlates wrist + landmark packets into per-hand `HandFrame`
-objects. Head pose packets produce `HeadFrame` events. Stale out-of-order updates
-are discarded.
+`HandFrameAssembler` combines the latest wrist and landmarks for each hand. Once
+both are available, every accepted component update emits a `HandFrame`, reusing
+the other component. Head pose updates emit `HeadFrame` events when enabled.
+Updates older than the cached component are discarded; equal receive times are
+accepted because multiple lines can share one socket receive. Receive timestamps
+retain their original values for age checks; `sequence_id` advances on each output.
 
 A `HandFrame` includes:
 - `side`: Left or Right

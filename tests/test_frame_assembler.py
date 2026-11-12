@@ -1,4 +1,69 @@
-from hand_tracking_sdk import HandFrame, HandFrameAssembler, HandSide
+from hand_tracking_sdk import HandFrame, HandFrameAssembler, HandSide, HeadFrame, parse_line
+
+
+def test_equal_receive_times_emit_each_accepted_component_update() -> None:
+    assembler = HandFrameAssembler(include_wall_time=False)
+    wrist0 = parse_line("Right wrist:, 0, 0, 0, 0, 0, 0, 1")
+    wrist1 = parse_line("Right wrist:, 1, 2, 3, 0, 0, 0, 1")
+    landmarks0 = parse_line("Right landmarks:, " + ", ".join("0" for _ in range(63)))
+    landmarks1 = parse_line("Right landmarks:, " + ", ".join("1" for _ in range(63)))
+    received_ns = 100
+
+    assert assembler.push_packet(wrist0, recv_ts_ns=received_ns) is None
+    for sequence_id, (packet, wrist, landmarks) in enumerate([
+        (landmarks0, wrist0.data, landmarks0.data),
+        (wrist1, wrist1.data, landmarks0.data),
+        (landmarks1, wrist1.data, landmarks1.data),
+    ]):
+        frame = assembler.push_packet(packet, recv_ts_ns=received_ns)
+        assert isinstance(frame, HandFrame)
+        assert (frame.wrist, frame.landmarks) == (wrist, landmarks)
+        assert frame.sequence_id == sequence_id
+        assert frame.recv_ts_ns == received_ns
+        assert frame.wrist_recv_ts_ns == received_ns
+        assert frame.landmarks_recv_ts_ns == received_ns
+
+    # Older packets must not overwrite either cached component.
+    assert assembler.push_packet(wrist0, recv_ts_ns=received_ns - 1) is None
+    frame = assembler.push_packet(landmarks1, recv_ts_ns=received_ns)
+    assert isinstance(frame, HandFrame)
+    assert (frame.wrist, frame.landmarks) == (wrist1.data, landmarks1.data)
+    assert frame.sequence_id == 3
+    assert assembler.push_packet(landmarks0, recv_ts_ns=received_ns - 1) is None
+    frame = assembler.push_packet(wrist1, recv_ts_ns=received_ns)
+    assert isinstance(frame, HandFrame)
+    assert (frame.wrist, frame.landmarks) == (wrist1.data, landmarks1.data)
+    assert frame.sequence_id == 4
+
+
+def test_equal_receive_times_emit_head_updates_and_reject_older_packets() -> None:
+    assembler = HandFrameAssembler(include_head_frames=True, include_wall_time=False)
+    head0 = parse_line("Head pose | f = 0 | t = 10:, 0, 0, 0, 0, 0, 0, 1")
+    head1 = parse_line("Head pose | f = 1 | t = 20:, 1, 2, 3, 0, 0, 0, 1")
+    received_ns = 100
+
+    for sequence_id, packet in enumerate((head0, head1)):
+        frame = assembler.push_packet(packet, recv_ts_ns=received_ns)
+        assert isinstance(frame, HeadFrame)
+        assert frame.head == packet.data
+        assert frame.sequence_id == sequence_id
+        assert frame.recv_ts_ns == received_ns
+
+    assert assembler.push_packet(head0, recv_ts_ns=received_ns - 1) is None
+    assert assembler.push_packet(head0, recv_ts_ns=received_ns - 1) is None
+    frame = assembler.push_packet(head1, recv_ts_ns=received_ns)
+    assert isinstance(frame, HeadFrame)
+    assert frame.head == head1.data
+    assert frame.sequence_id == 2
+    assert frame.recv_ts_ns == received_ns
+    assert frame.source_ts_ns == 20
+    assert frame.source_frame_seq == 1
+
+    frame = assembler.push_packet(head0, recv_ts_ns=received_ns, source_ts_ns=99)
+    assert isinstance(frame, HeadFrame)
+    assert frame.source_ts_ns == 99
+    assert frame.source_frame_seq == 0
+    assert frame.sequence_id == 3
 
 
 def test_frame_emits_only_when_both_components_present() -> None:
