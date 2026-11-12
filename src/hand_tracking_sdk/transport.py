@@ -7,7 +7,7 @@ from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from select import select
-from time import sleep
+from time import monotonic_ns, sleep
 from typing import cast
 
 from hand_tracking_sdk.exceptions import (
@@ -99,7 +99,11 @@ class TCPClientConfig:
 
 
 class UDPLineReceiver:
-    """Receive UTF-8 HTS lines over UDP datagrams."""
+    """Receive UTF-8 HTS lines over UDP datagrams.
+
+    ``last_recv_ts_ns`` is the host monotonic receive time of the last returned
+    line (zero before the first line). Queued lines retain their datagram's time.
+    """
 
     def __init__(self, config: UDPReceiverConfig | None = None) -> None:
         """Create a UDP receiver.
@@ -109,7 +113,8 @@ class UDPLineReceiver:
         """
         self._config = config or UDPReceiverConfig()
         self._socket: socket.socket | None = None
-        self._pending_lines: deque[str] = deque()
+        self._pending_lines: deque[tuple[str, int]] = deque()
+        self.last_recv_ts_ns = 0
 
     @property
     def local_address(self) -> tuple[str, int]:
@@ -166,11 +171,13 @@ class UDPLineReceiver:
             raise TransportClosedError("UDP receiver is not open.")
 
         if self._pending_lines:
-            return self._pending_lines.popleft()
+            line, self.last_recv_ts_ns = self._pending_lines.popleft()
+            return line
 
         while True:
             try:
                 payload, _ = self._socket.recvfrom(self._config.max_datagram_size)
+                recv_ts_ns = monotonic_ns()
             except TimeoutError as exc:
                 raise TransportTimeoutError("Timed out waiting for UDP packet.") from exc
 
@@ -179,7 +186,8 @@ class UDPLineReceiver:
             if not lines:
                 continue
 
-            self._pending_lines.extend(lines[1:])
+            self._pending_lines.extend((line, recv_ts_ns) for line in lines[1:])
+            self.last_recv_ts_ns = recv_ts_ns
             return lines[0]
 
     def iter_lines(self) -> Iterator[str]:
@@ -198,7 +206,11 @@ class UDPLineReceiver:
 
 
 class TCPServerLineReceiver:
-    """Receive UTF-8 HTS lines from one or more inbound TCP client connections."""
+    """Receive UTF-8 HTS lines from one or more inbound TCP client connections.
+
+    ``last_recv_ts_ns`` is the host monotonic receive time of the chunk completing
+    the last returned line (zero before the first line), preserved while queued.
+    """
 
     def __init__(self, config: TCPServerConfig | None = None) -> None:
         """Create a TCP server receiver.
@@ -210,7 +222,8 @@ class TCPServerLineReceiver:
         self._server_socket: socket.socket | None = None
         self._client_sockets: set[socket.socket] = set()
         self._client_buffers: dict[socket.socket, bytearray] = {}
-        self._pending_lines: deque[str] = deque()
+        self._pending_lines: deque[tuple[str, int]] = deque()
+        self.last_recv_ts_ns = 0
 
     @property
     def local_address(self) -> tuple[str, int]:
@@ -297,6 +310,7 @@ class TCPServerLineReceiver:
 
         try:
             chunk = client_socket.recv(4096)
+            recv_ts_ns = monotonic_ns()
         except BlockingIOError:
             return False
         except OSError:
@@ -318,7 +332,8 @@ class TCPServerLineReceiver:
                 break
             raw = bytes(buffer[:newline_index])
             del buffer[: newline_index + 1]
-            self._pending_lines.append(raw.decode(self._config.encoding, errors="strict").strip())
+            line = raw.decode(self._config.encoding, errors="strict").strip()
+            self._pending_lines.append((line, recv_ts_ns))
 
         return False
 
@@ -341,7 +356,8 @@ class TCPServerLineReceiver:
             raise TransportClosedError("TCP server receiver is not open.")
 
         if self._pending_lines:
-            return self._pending_lines.popleft()
+            line, self.last_recv_ts_ns = self._pending_lines.popleft()
+            return line
 
         while True:
             wait_for_connection = not self._client_sockets
@@ -370,7 +386,8 @@ class TCPServerLineReceiver:
                     disconnected = self._drain_ready_client(client_socket) or disconnected
 
             if self._pending_lines:
-                return self._pending_lines.popleft()
+                line, self.last_recv_ts_ns = self._pending_lines.popleft()
+                return line
 
             if disconnected and not self._client_sockets:
                 raise TransportDisconnectedError("TCP client disconnected.")
@@ -391,7 +408,11 @@ class TCPServerLineReceiver:
 
 
 class TCPClientLineReceiver:
-    """Receive UTF-8 HTS lines from an outbound TCP client connection."""
+    """Receive UTF-8 HTS lines from an outbound TCP client connection.
+
+    ``last_recv_ts_ns`` is the host monotonic receive time of the chunk completing
+    the last returned line (zero before the first line), preserved while buffered.
+    """
 
     def __init__(self, config: TCPClientConfig) -> None:
         """Create a TCP client receiver.
@@ -402,6 +423,8 @@ class TCPClientLineReceiver:
         self._config = config
         self._socket: socket.socket | None = None
         self._buffer = bytearray()
+        self._buffer_recv_ts_ns = 0
+        self.last_recv_ts_ns = 0
 
     def open(self) -> None:
         """Open TCP connection to configured host and port.
@@ -456,6 +479,7 @@ class TCPClientLineReceiver:
             if newline_index >= 0:
                 raw = bytes(self._buffer[:newline_index])
                 del self._buffer[: newline_index + 1]
+                self.last_recv_ts_ns = self._buffer_recv_ts_ns
                 return raw.decode(self._config.encoding, errors="strict").strip()
 
             if len(self._buffer) >= self._config.max_line_bytes:
@@ -464,6 +488,7 @@ class TCPClientLineReceiver:
 
             try:
                 chunk = self._socket.recv(4096)
+                self._buffer_recv_ts_ns = monotonic_ns()
             except TimeoutError as exc:
                 raise TransportTimeoutError("Timed out waiting for TCP data.") from exc
 

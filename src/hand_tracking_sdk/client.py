@@ -162,6 +162,8 @@ class HTSClientConfig:
 class _LineReceiver(Protocol):
     """Protocol for line-oriented transport receivers used by :class:`HTSClient`."""
 
+    last_recv_ts_ns: int
+
     def __enter__(self) -> _LineReceiver: ...
 
     def __exit__(self, *_: object) -> None: ...
@@ -208,6 +210,7 @@ class HTSClient:
         receiver = self._make_receiver()
         with receiver:
             for line in receiver.iter_lines():
+                recv_ts_ns = receiver.last_recv_ts_ns
                 self._stats = self._stats_with(lines_received=self._stats.lines_received + 1)
                 self._emit_log(
                     StreamLogEvent(
@@ -247,7 +250,7 @@ class HTSClient:
                     yield packet
 
                 if self._config.output in (StreamOutput.FRAMES, StreamOutput.BOTH):
-                    frame = self._frame_assembler.push_packet(packet)
+                    frame = self._frame_assembler.push_packet(packet, recv_ts_ns=recv_ts_ns)
                     if frame is not None:
                         self._stats = self._stats_with(
                             frames_emitted=self._stats.frames_emitted + 1

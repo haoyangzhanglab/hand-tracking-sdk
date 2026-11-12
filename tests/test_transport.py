@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -16,6 +17,44 @@ from hand_tracking_sdk import (
     UDPLineReceiver,
     UDPReceiverConfig,
 )
+
+
+@pytest.mark.parametrize("mode", ["udp", "tcp_server", "tcp_client"])
+def test_receive_timestamps_survive_queueing(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    sock, server = Mock(), Mock()
+    now_ns = 10**10
+    received_ns = now_ns
+    monkeypatch.setattr("hand_tracking_sdk.transport.monotonic_ns", lambda: now_ns)
+    monkeypatch.setattr("hand_tracking_sdk.transport.socket.socket",
+                        lambda *a: server if mode == "tcp_server" else sock)
+    server.accept.side_effect = [(sock, ("fake", 8000)), BlockingIOError()]
+    monkeypatch.setattr("hand_tracking_sdk.transport.select", Mock(side_effect=[
+        ([server], [], []), ([sock], [], []), ([sock], [], []),
+    ]))
+    if mode == "udp":
+        receiver = UDPLineReceiver()
+        sock.recvfrom.side_effect = [
+            (b"first\nsecond\n", ("fake", 8000)), (b"fresh\n", ("fake", 8000)),
+        ]
+    elif mode == "tcp_server":
+        receiver = TCPServerLineReceiver()
+    else:
+        receiver = TCPClientLineReceiver(TCPClientConfig())
+    sock.recv.side_effect = [b"first\nsecond\npartial", b"-end\nfresh\n"]
+
+    with receiver:
+        lines = receiver.iter_lines()
+        assert next(lines) == "first"
+        assert receiver.last_recv_ts_ns == received_ns
+        now_ns += 10**9
+        assert next(lines) == "second"
+        assert receiver.last_recv_ts_ns == received_ns
+        if mode != "udp":
+            # A partial line is dated when the chunk containing its newline arrives.
+            assert next(lines) == "partial-end"
+            assert receiver.last_recv_ts_ns == now_ns
+        assert next(lines) == "fresh"
+        assert receiver.last_recv_ts_ns == now_ns
 
 
 def _find_free_port() -> int:

@@ -25,6 +25,7 @@ from hand_tracking_sdk import (
 class FakeLineReceiver:
     def __init__(self, lines: list[str]) -> None:
         self._lines = lines
+        self.last_recv_ts_ns = 0
 
     def __enter__(self) -> "FakeLineReceiver":
         return self
@@ -33,7 +34,9 @@ class FakeLineReceiver:
         return None
 
     def iter_lines(self) -> Iterator[str]:
-        yield from self._lines
+        for index, line in enumerate(self._lines, start=1):
+            self.last_recv_ts_ns = index
+            yield line
 
 
 def _make_client(config: HTSClientConfig, lines: list[str]) -> HTSClient:
@@ -105,6 +108,26 @@ def test_iter_events_both_mode_emits_packets_and_frames() -> None:
 
     assert len(events) == 3
     assert isinstance(events[-1], HandFrame)
+
+
+def test_iter_events_preserves_receive_time_after_packet_yield(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now_ns = 10**10
+    monkeypatch.setattr("hand_tracking_sdk.frame.monotonic_ns", lambda: now_ns)
+    client = _make_client(HTSClientConfig(output=StreamOutput.BOTH), [
+        "Right wrist:, 0, 0, 0, 0, 0, 0, 1",
+        "Right landmarks:, " + ", ".join("0" for _ in range(63)),
+    ])
+    events = client.iter_events()
+    assert isinstance(next(events), WristPacket)
+    now_ns += 10**9
+    assert isinstance(next(events), LandmarksPacket)
+    now_ns += 10**9
+    frame = next(events)
+    assert isinstance(frame, HandFrame)
+    assert frame.wrist_recv_ts_ns == 1
+    assert frame.landmarks_recv_ts_ns == 2
 
 
 def test_hand_filter_left_drops_right() -> None:
